@@ -1,12 +1,17 @@
 //! This module provides common utilities, traits and structures for group,
 //! field and polynomial arithmetic.
 
+use std::{env::var, time::Instant, mem::{size_of, self}};
+
+use crate::plonk::{env_value, start_measure, stop_measure, self};
+
 use super::multicore;
 pub use ff::Field;
 use group::{
     ff::{BatchInvert, PrimeField},
-    Group as _,
+    Group as _, prime::PrimeCurveAffine,
 };
+use ark_std::{end_timer, start_timer, perf_trace::TimerInfo};
 
 pub use pairing::arithmetic::*;
 
@@ -20,6 +25,8 @@ fn multiexp_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], acc: &mut 
     } else {
         (f64::from(bases.len() as u32)).ln().ceil() as usize
     };
+
+    //println!("c: {}", c);
 
     fn get_at<F: PrimeField>(segment: usize, c: usize, bytes: &F::Repr) -> usize {
         let skip_bits = segment * c;
@@ -43,40 +50,40 @@ fn multiexp_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], acc: &mut 
 
     let segments = (256 / c) + 1;
 
+    #[derive(Clone, Copy)]
+    enum Bucket<C: CurveAffine> {
+        None,
+        Affine(C),
+        Projective(C::Curve),
+    }
+
+    impl<C: CurveAffine> Bucket<C> {
+        fn add_assign(&mut self, other: &C) {
+            *self = match *self {
+                Bucket::None => Bucket::Affine(*other),
+                Bucket::Affine(a) => Bucket::Projective(a + *other),
+                Bucket::Projective(mut a) => {
+                    a += *other;
+                    Bucket::Projective(a)
+                }
+            }
+        }
+
+        fn add(self, mut other: C::Curve) -> C::Curve {
+            match self {
+                Bucket::None => other,
+                Bucket::Affine(a) => {
+                    other += a;
+                    other
+                }
+                Bucket::Projective(a) => other + &a,
+            }
+        }
+    }
+
     for current_segment in (0..segments).rev() {
         for _ in 0..c {
             *acc = acc.double();
-        }
-
-        #[derive(Clone, Copy)]
-        enum Bucket<C: CurveAffine> {
-            None,
-            Affine(C),
-            Projective(C::Curve),
-        }
-
-        impl<C: CurveAffine> Bucket<C> {
-            fn add_assign(&mut self, other: &C) {
-                *self = match *self {
-                    Bucket::None => Bucket::Affine(*other),
-                    Bucket::Affine(a) => Bucket::Projective(a + *other),
-                    Bucket::Projective(mut a) => {
-                        a += *other;
-                        Bucket::Projective(a)
-                    }
-                }
-            }
-
-            fn add(self, mut other: C::Curve) -> C::Curve {
-                match self {
-                    Bucket::None => other,
-                    Bucket::Affine(a) => {
-                        other += a;
-                        other
-                    }
-                    Bucket::Projective(a) => other + &a,
-                }
-            }
         }
 
         let mut buckets: Vec<Bucket<C>> = vec![Bucket::None; (1 << c) - 1];
@@ -103,6 +110,8 @@ fn multiexp_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], acc: &mut 
 /// Performs a small multi-exponentiation operation.
 /// Uses the double-and-add algorithm with doublings shared across points.
 pub fn small_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+    //let start = start_timer!(|| "small_multiexp");
+
     let coeffs: Vec<_> = coeffs.iter().map(|a| a.to_repr()).collect();
     let mut acc = C::Curve::identity();
 
@@ -121,6 +130,8 @@ pub fn small_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::C
         }
     }
 
+    //end_timer!(start);
+
     acc
 }
 
@@ -132,7 +143,21 @@ pub fn small_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::C
 pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
     assert_eq!(coeffs.len(), bases.len());
 
+    /*let zero = C::Scalar::zero();
+    let one = C::Scalar::one();
+    let mut count_zero = 0usize;
+    let mut count_one = 0usize;
+    for coeff in coeffs {
+        if *coeff == zero {
+            count_zero += 1;
+        } else if *coeff == one {
+            count_one += 1;
+        }
+    }
+    println!("size: {}, zeros: {}, ones: {}", coeffs.len(), count_zero, count_one);*/
+
     let num_threads = multicore::current_num_threads();
+    let start = start_measure(format!("best multiexp {} ({})", coeffs.len(), num_threads));
     if coeffs.len() > num_threads {
         let chunk = coeffs.len() / num_threads;
         let num_chunks = coeffs.chunks(chunk).len();
@@ -150,10 +175,216 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
                 });
             }
         });
-        results.iter().fold(C::Curve::identity(), |a, b| a + b)
+        let res = results.iter().fold(C::Curve::identity(), |a, b| a + b);
+        stop_measure(start);
+        res
     } else {
         let mut acc = C::Curve::identity();
         multiexp_serial(coeffs, bases, &mut acc);
+        stop_measure(start);
+        acc
+    }
+}
+
+fn prefetch_range<const STRATEGY: i32>(start: *const i8, len: usize, prefetch_stride: usize)
+{
+    use core::arch::x86_64::_mm_prefetch;
+    use ark_std::arch::x86_64::{_MM_HINT_T0, _MM_HINT_T1, _MM_HINT_T2/*, _MM_HINT_ET0*/};
+
+    #[allow(unsafe_code)]
+    unsafe {
+        for offset in (0..len).step_by(prefetch_stride) {
+            _mm_prefetch(start.offset(offset as isize), STRATEGY);
+        }
+    }
+}
+
+
+fn prefetch_multiexp_serial<C: CurveAffine, const PREFETCH: bool, const STRATEGY: i32>(coeffs: &[<C::Scalar as PrimeField>::Repr], bases: &[C], settings: &MultiExpSettings, segment: usize, acc: &mut C::Curve) {
+    let c = settings.c;
+    let lookahead = settings.prefetch_lookahead;
+    let stride = settings.prefetch_stride;
+
+    fn get_at<F: PrimeField>(segment: usize, c: usize, bytes: &F::Repr) -> usize {
+        let skip_bits = segment * c;
+        let skip_bytes = skip_bits / 8;
+
+        if skip_bytes >= 32 {
+            return 0;
+        }
+
+        let mut v = [0; 8];
+        for (v, o) in v.iter_mut().zip(bytes.as_ref()[skip_bytes..].iter()) {
+            *v = *o;
+        }
+
+        let mut tmp = u64::from_le_bytes(v);
+        tmp >>= skip_bits - (skip_bytes * 8);
+        tmp = tmp % (1 << c);
+
+        tmp as usize
+    }
+
+    #[derive(Clone, Copy)]
+    enum Bucket<C: CurveAffine> {
+        None,
+        Affine(C),
+        Projective(C::Curve),
+    }
+
+    impl<C: CurveAffine> Bucket<C> {
+        fn add_assign(&mut self, other: &C) {
+            *self = match *self {
+                Bucket::None => Bucket::Affine(*other),
+                Bucket::Affine(a) => Bucket::Projective(a + *other),
+                Bucket::Projective(mut a) => {
+                    a += *other;
+                    Bucket::Projective(a)
+                }
+            }
+        }
+
+        fn add(self, mut other: C::Curve) -> C::Curve {
+            match self {
+                Bucket::None => other,
+                Bucket::Affine(a) => {
+                    other += a;
+                    other
+                }
+                Bucket::Projective(a) => other + &a,
+            }
+        }
+    }
+
+    let mut buckets: Vec<Bucket<C>> = vec![Bucket::None; (1 << c) - 1];
+
+    for (idx, (coeff, base)) in coeffs.iter().zip(bases.iter()).enumerate() {
+        // prefetch
+        if PREFETCH {
+            //println!("size: {}", mem::size_of::<C>() + 4);
+            if idx + lookahead < coeffs.len() {
+                let coeff = get_at::<C::Scalar>(segment, c, &coeffs[idx + lookahead]);
+                if coeff != 0 {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        prefetch_range::<STRATEGY>(
+                            buckets.as_ptr().offset((coeff - 1) as isize) as *const i8,
+                            mem::size_of::<C>() + 4,
+                            stride,
+                        );
+                        //let ptr = &buckets[coeff] as *const i8;
+                        //_mm_prefetch(buckets.as_ptr().offset(coeff as isize) as *const i8, _MM_HINT_T0)
+                    }
+                }
+            }
+        }
+        let coeff = get_at::<C::Scalar>(segment, c, coeff);
+        if coeff != 0 {
+            buckets[coeff - 1].add_assign(base);
+        }
+    }
+
+    // Summation by parts
+    // e.g. 3a + 2b + 1c = a +
+    //                    (a) + b +
+    //                    ((a) + b) + c
+    let mut running_sum = C::Curve::identity();
+    for exp in buckets.into_iter().rev() {
+        running_sum = exp.add(running_sum);
+        *acc = *acc + &running_sum;
+    }
+}
+
+/// Settings
+#[derive(Debug)]
+pub struct MultiExpSettings {
+    c: usize,
+    prefetch: bool,
+    prefetch_lookahead: usize,
+    prefetch_stride: usize,
+    prefetch_strategy: i32,
+}
+
+/// Performs a multi-exponentiation operation.
+///
+/// This function will panic if coeffs and bases have a different length.
+///
+/// This will use multithreading if beneficial.
+pub fn prefetch_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], settings: &MultiExpSettings) -> C::Curve {
+    assert_eq!(coeffs.len(), bases.len());
+    let num_threads = multicore::current_num_threads();
+
+    let start = start_measure(format!("exponents to_repr {} ({})", coeffs.len(), num_threads));
+    // Coeffs
+    //let coeffs: Vec<_> = coeffs.iter().map(|a| a.to_repr()).collect();
+    let mut exponents: Vec<_> = vec![C::Scalar::zero().to_repr(); coeffs.len()];
+    for idx in 0..exponents.len() {
+        exponents[idx] = coeffs[idx].to_repr();
+    }
+    stop_measure(start);
+
+    let exps = &exponents.clone();
+
+    let zero = C::Scalar::zero();
+    let one = C::Scalar::one();
+    let mut count_zero = 0usize;
+    let mut count_one = 0usize;
+    for coeff in coeffs {
+        if *coeff == zero {
+            count_zero += 1;
+        } else if *coeff == one {
+            count_one += 1;
+        }
+    }
+    println!("size: {}, zeros: {}, ones: {}", coeffs.len(), count_zero, count_one);
+
+    /*parallelize(&mut exponents, |coeffs, start| {
+        for (exponent, coeff) in exponents.iter_mut().zip(coeffs[start..start+exponents.len()].iter()) {
+            *exponent = coeff.to_repr();
+        }
+    });*/
+
+    let start = start_measure(format!("prefetch multiexp {} ({}) {:?}", coeffs.len(), num_threads, settings));
+    if coeffs.len() > num_threads {
+        let num_chunks = (254 + settings.c - 1) / settings.c;
+        println!("num_chunks: {}", num_chunks);
+        let mut partials = vec![C::Curve::identity(); num_chunks];
+        multicore::scope(|scope| {
+            for (k, acc) in partials.iter_mut().enumerate() {
+                scope.spawn(move |_| {
+                    if settings.prefetch {
+                        match settings.prefetch_strategy {
+                            0 => prefetch_multiexp_serial::<C,true,0>(exps, bases, settings, k, acc),
+                            1 => prefetch_multiexp_serial::<C,true,1>(exps, bases, settings, k, acc),
+                            2 => prefetch_multiexp_serial::<C,true,2>(exps, bases, settings, k, acc),
+                            3 => prefetch_multiexp_serial::<C,true,3>(exps, bases, settings, k, acc),
+                            4 => prefetch_multiexp_serial::<C,true,4>(exps, bases, settings, k, acc),
+                            5 => prefetch_multiexp_serial::<C,true,5>(exps, bases, settings, k, acc),
+                            6 => prefetch_multiexp_serial::<C,true,6>(exps, bases, settings, k, acc),
+                            7 => prefetch_multiexp_serial::<C,true,7>(exps, bases, settings, k, acc),
+                            _ => unimplemented!()
+                        }
+                    } else {
+                        prefetch_multiexp_serial::<C,false,0>(exps, bases, settings, k, acc);
+                    }
+                });
+            }
+        });
+
+        let mut res = partials[num_chunks - 1];
+        for i in (0..=num_chunks - 2).rev() {
+            for _ in 0..settings.c {
+                res = res.double();
+            }
+            res = res + partials[i];
+        }
+
+        stop_measure(start);
+        res
+    } else {
+        let mut acc = C::Curve::identity();
+        multiexp_serial(coeffs, bases, &mut acc);
+        stop_measure(start);
         acc
     }
 }
@@ -172,11 +403,13 @@ pub fn best_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
     let threads = multicore::current_num_threads();
     let log_threads = log2_floor(threads);
 
+    let start = start_measure(format!("best_fft {} ({})", a.len(), threads));
     if log_n <= log_threads {
         serial_fft(a, omega, log_n);
     } else {
         parallel_fft(a, omega, log_n, log_threads);
     }
+    stop_measure(start);
 }
 
 fn serial_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
@@ -332,6 +565,25 @@ pub fn parallelize<T: Send, F: Fn(&mut [T], usize) + Send + Sync + Clone>(v: &mu
     });
 }
 
+/// This simple utility function will parallelize an operation that is to be
+/// performed over a mutable slice.
+pub fn parallelize_count<T: Send, F: Fn(&mut [T], usize) + Send + Sync + Clone>(v: &mut [T], num_threads: usize, f: F) {
+    let n = v.len();
+    let mut chunk = (n as usize) / num_threads;
+    if chunk < num_threads {
+        chunk = n as usize;
+    }
+
+    multicore::scope(|scope| {
+        for (chunk_num, v) in v.chunks_mut(chunk).enumerate() {
+            let f = f.clone();
+            scope.spawn(move |_| {
+                f(v, chunk_num);
+            });
+        }
+    });
+}
+
 fn log2_floor(num: usize) -> u32 {
     assert!(num > 0);
 
@@ -404,6 +656,7 @@ pub fn lagrange_interpolate<F: FieldExt>(points: &[F], evals: &[F]) -> Vec<F> {
 
 #[cfg(test)]
 use pairing::bn256::Fr as Fp;
+use pairing::bn256 as bn256;
 
 #[test]
 fn test_lagrange_interpolate() {
@@ -422,3 +675,53 @@ fn test_lagrange_interpolate() {
         }
     }
 }
+
+#[test]
+fn test_multiexp() {
+    let n = 1 << env_value("K", 16);
+
+    let c = env_value("C", 16);
+    let prefetch = env_value("PREFETCH", 1) != 0;
+    let prefetch_lookahead = env_value("look", 1);
+    let prefetch_stride = env_value("stride", 16);
+    let prefetch_strategy = env_value("strategy", 7) as i32;
+
+    let mut settings = MultiExpSettings {
+        c,
+        prefetch,
+        prefetch_lookahead,
+        prefetch_stride,
+        prefetch_strategy,
+    };
+
+    let mut coeffs = vec![Fp::zero(); n];
+    for i in 0..n {
+        coeffs[i] = Fp::rand();
+    }
+
+    let rng = &mut rand::thread_rng();
+    let bases = vec![pairing::bn256::G1Affine::random(rng); n];
+
+    /*let res_a = best_multiexp(&coeffs, &bases);
+
+    let res_b = prefetch_multiexp(&coeffs, &bases, &settings);
+
+    assert_eq!(res_a, res_b);*/
+
+    settings.prefetch = false;
+    let res_a = prefetch_multiexp(&coeffs, &bases, &settings);
+
+    for lookahead in 1..=4 {
+        for stride in [16usize].iter() {
+            for strategy in 0..=7 {
+                settings.prefetch = true;
+                settings.prefetch_lookahead = lookahead;
+                settings.prefetch_stride = *stride;
+                settings.prefetch_strategy = strategy;
+                let res_b = prefetch_multiexp(&coeffs, &bases, &settings);
+                assert_eq!(res_a, res_b);
+            }
+        }
+    }
+}
+

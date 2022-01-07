@@ -1,6 +1,9 @@
 use core::cmp::max;
 use core::ops::{Add, Mul};
-use ff::Field;
+use std::collections::HashMap;
+use ff::{Field, PrimeField};
+use pairing::arithmetic::FieldExt;
+use subtle::Choice;
 use std::{
     convert::TryFrom,
     ops::{Neg, Sub},
@@ -640,6 +643,132 @@ pub enum Expression<F> {
     Scaled(Box<Expression<F>>, F),
 }
 
+ /// Generates optimized code for the expression
+ pub fn scalar_to_string<F: Field>(v: F) -> String {
+    if v == F::zero() {
+        "zero".to_string()
+    } else if v == F::one() {
+        "one".to_string()
+    } else {
+        format!("F::from_bytes(&decode_hex(\"{:?}\").try_into().unwrap()).unwrap()", v).to_string()
+    }
+}
+
+/// Temp
+#[derive(Debug)]
+pub struct CodeInfo {
+    code: String,
+    counter: usize,
+}
+
+/// Temp
+#[derive(Debug)]
+pub struct CodeGenerationData<F: Field> {
+    /// Temp
+    pub results: Vec<CodeInfo>,
+    /// Temp
+    pub constants: Vec<F>,
+    /// Temp
+    pub rotations: Vec<i32>,
+}
+
+
+impl<F: Field> CodeGenerationData<F> {
+    /// Temp
+    pub fn add_rotation(&mut self, rotation: &Rotation) -> String {
+        let position = self.rotations.iter().position(|&c| c == rotation.0);
+        let idx = match position {
+            Some(pos) => pos,
+            None => {
+                self.rotations.push(rotation.0);
+                self.rotations.len() - 1
+            }
+        };
+        format!("r_{}", idx)
+    }
+
+    /// Temp
+    pub fn add_constant(&mut self,  constant: &F) -> String {
+        let position = self.constants.iter().position(|&c| c == *constant);
+        let idx = match position {
+            Some(pos) => pos,
+            None => {
+                self.constants.push(*constant);
+                self.constants.len() - 1
+            }
+        };
+        format!("c_{}", idx)
+    }
+
+    /// Temp
+    pub fn reuse_code(&mut self, code: String) -> String {
+        if code.starts_with("<") && code.ends_with(">") {
+            code
+        } else {
+            let position = self.results.iter().position(|c| c.code == code);
+            let idx = match position {
+                Some(pos) => {
+                    self.results[pos].counter += 1;
+                    pos
+                }
+                None => {
+                    self.results.push(CodeInfo { code, counter: 1 });
+                    self.results.len() - 1
+                }
+            };
+            format!("<{}>", idx)
+        }
+    }
+
+    /// Generates optimized code for the expression
+    pub fn get_code(&self, post_code: String) -> String {
+        let mut code = "".to_string();
+        for (idx, c) in self.constants.iter().enumerate() {
+            code += &format!("let c_{} = {};\n", idx, scalar_to_string::<F>(*c));
+        }
+
+        code += "parallelize(&mut values, |values, start| {\n";
+        code += "let isize = size as i32;\n";
+        code += "for (i, value) in values.iter_mut().enumerate() {\n";
+        code += "let idx = i + start;\n\n";
+
+        for (idx, c) in self.rotations.iter().enumerate() {
+            code += &format!("let r_{} = (((idx as i32) + ({} * rot_scale)).rem_euclid(isize)) as usize;\n", idx, c);
+        }
+
+        let write_code = |code: &String| {
+            let mut out = "".to_string();
+            for c in code.chars() {
+                if c == '<' {
+                    out += &"i_";
+                } else if c == '>' {
+                    // don't do anything
+                } else {
+                    out += &c.to_string();
+                }
+            }
+            out
+        };
+
+        for (idx, c) in self.results.iter().enumerate() {
+            let mut part = write_code(&c.code);
+            if part.starts_with("(") && part.ends_with(")") {
+                part = part[1..part.len()-1].to_string();
+            }
+            code += &format!("let i_{} = {};  // {}\n", idx, part, c.counter);
+        }
+        code += "\n\n";
+
+        code += &write_code(&post_code);
+
+        code += "}\n";
+        code += "});\n\n";
+
+        code
+    }
+}
+
+
 impl<F: Field> Expression<F> {
     /// Evaluate the polynomial using the provided closures to perform the
     /// operations.
@@ -750,6 +879,289 @@ impl<F: Field> Expression<F> {
                     scaled,
                 );
                 scaled(a, *f)
+            }
+        }
+    }
+
+    /// Evaluate the polynomial using the provided closures to perform the
+    /// operations.
+    pub fn evaluate2(
+        &self,
+        constant: &impl Fn(F) -> F,
+        selector_column: &impl Fn(Selector) -> F,
+        fixed_column: &impl Fn(usize, usize, Rotation) -> F,
+        advice_column: &impl Fn(usize, usize, Rotation) -> F,
+        instance_column: &impl Fn(usize, usize, Rotation) -> F,
+        negated: &impl Fn(F) -> F,
+        sum: &impl Fn(F, F) -> F,
+        product: &impl Fn(F, F) -> F,
+        scaled: &impl Fn(F, F) -> F,
+    ) -> F {
+        match self {
+            Expression::Constant(scalar) => constant(*scalar),
+            Expression::Selector(selector) => selector_column(*selector),
+            Expression::Fixed {
+                query_index,
+                column_index,
+                rotation,
+            } => fixed_column(*query_index, *column_index, *rotation),
+            Expression::Advice {
+                query_index,
+                column_index,
+                rotation,
+            } => advice_column(*query_index, *column_index, *rotation),
+            Expression::Instance {
+                query_index,
+                column_index,
+                rotation,
+            } => instance_column(*query_index, *column_index, *rotation),
+            Expression::Negated(a) => {
+                let a = a.evaluate(
+                    constant,
+                    selector_column,
+                    fixed_column,
+                    advice_column,
+                    instance_column,
+                    negated,
+                    sum,
+                    product,
+                    scaled,
+                );
+                negated(a)
+            }
+            Expression::Sum(a, b) => {
+                let a = a.evaluate(
+                    constant,
+                    selector_column,
+                    fixed_column,
+                    advice_column,
+                    instance_column,
+                    negated,
+                    sum,
+                    product,
+                    scaled,
+                );
+                let b = b.evaluate(
+                    constant,
+                    selector_column,
+                    fixed_column,
+                    advice_column,
+                    instance_column,
+                    negated,
+                    sum,
+                    product,
+                    scaled,
+                );
+                sum(a, b)
+            }
+            Expression::Product(a, b) => {
+                if a.degree() <= b.degree() {
+                    let a = a.evaluate(
+                        constant,
+                        selector_column,
+                        fixed_column,
+                        advice_column,
+                        instance_column,
+                        negated,
+                        sum,
+                        product,
+                        scaled,
+                    );
+                    if a.is_zero_vartime() {
+                        F::zero()
+                    } else {
+                        let b = b.evaluate(
+                            constant,
+                            selector_column,
+                            fixed_column,
+                            advice_column,
+                            instance_column,
+                            negated,
+                            sum,
+                            product,
+                            scaled,
+                        );
+                        product(a, b)
+                    }
+                } else {
+                    let b = b.evaluate(
+                        constant,
+                        selector_column,
+                        fixed_column,
+                        advice_column,
+                        instance_column,
+                        negated,
+                        sum,
+                        product,
+                        scaled,
+                    );
+                    if b.is_zero_vartime() {
+                        F::zero()
+                    } else {
+                        let a = a.evaluate(
+                            constant,
+                            selector_column,
+                            fixed_column,
+                            advice_column,
+                            instance_column,
+                            negated,
+                            sum,
+                            product,
+                            scaled,
+                        );
+                        product(a, b)
+                    }
+                }
+            }
+            Expression::Scaled(a, f) => {
+                let a = a.evaluate(
+                    constant,
+                    selector_column,
+                    fixed_column,
+                    advice_column,
+                    instance_column,
+                    negated,
+                    sum,
+                    product,
+                    scaled,
+                );
+                scaled(a, *f)
+            }
+        }
+    }
+
+    /// Generates optimized code for the expression
+    pub fn generate_code(&self) -> String {
+        match self {
+            Expression::Constant(scalar) => format!("{}", scalar_to_string::<F>(*scalar)),
+            Expression::Selector(_selector) => "".to_string(),
+            Expression::Fixed {
+                query_index: _,
+                column_index,
+                rotation,
+            } => if rotation.0 == 0 {
+                    format!("fixed[{}].values[idx]", column_index)
+                } else {
+                    format!("fixed[{}].values[(((idx as i32) + ({} * rot_scale)) % isize) as usize]", column_index, rotation.0)
+                },
+            Expression::Advice {
+                query_index: _,
+                column_index,
+                rotation,
+            } => if rotation.0 == 0 {
+                    format!("advice[{}].values[idx]", column_index)
+                } else {
+                    format!("advice[{}].values[(((idx as i32) + ({} * rot_scale)) % isize) as usize]", column_index, rotation.0)
+                },
+            Expression::Instance {
+                query_index: _,
+                column_index,
+                rotation,
+            } => if rotation.0 == 0 {
+                    format!("instance[{}].values[idx]", column_index)
+                } else {
+                    format!("instance[{}].values[(((idx as i32) + ({} * rot_scale)) % isize) as usize]", column_index, rotation.0)
+                },
+            Expression::Negated(a) => {
+                format!("(-{})", a.generate_code())
+            }
+            Expression::Sum(a, b) => {
+                format!("({}+{})", a.generate_code(), b.generate_code())
+            }
+            Expression::Product(a, b) => {
+                if a.degree() <= b.degree() {
+                    format!("({}*{})", a.generate_code(), b.generate_code())
+                } else {
+                    format!("({}*{})", b.generate_code(), a.generate_code())
+                }
+            }
+            Expression::Scaled(a, f) => {
+                if *f == F::zero() {
+                    "".to_string()
+                } else if *f == F::one() {
+                    format!("{}", a.generate_code())
+                } else {
+                    format!("{}*{}", a.generate_code(), scalar_to_string::<F>(*f))
+                }
+            }
+        }
+    }
+
+    /// Generates optimized code for the expression
+    pub fn generate_code2(&self, data: &mut CodeGenerationData<F>) -> String {
+        match self {
+            Expression::Constant(scalar) => {
+                data.add_constant(scalar)
+            }
+            Expression::Selector(_selector) => "".to_string(),
+            Expression::Fixed {
+                query_index: _,
+                column_index,
+                rotation,
+            } => {
+                if rotation.0 == 0 {
+                    format!("fixed[{}].values[idx]", column_index)
+                } else {
+                    let rot_id = data.add_rotation(rotation);
+                    format!("fixed[{}].values[{}]", column_index, rot_id)
+                }
+            }
+            Expression::Advice {
+                query_index: _,
+                column_index,
+                rotation,
+            } => {
+                if rotation.0 == 0 {
+                    format!("advice[{}].values[idx]", column_index)
+                } else {
+                    let rot_id = data.add_rotation(rotation);
+                    format!("advice[{}].values[{}]", column_index, rot_id)
+                }
+            }
+            Expression::Instance {
+                query_index: _,
+                column_index,
+                rotation,
+            } => {
+                if rotation.0 == 0 {
+                    format!("instance[{}].values[idx]", column_index)
+                } else {
+                    let rot_id = data.add_rotation(rotation);
+                    format!("instance[{}].values[{}]", column_index, rot_id)
+                }
+            }
+            Expression::Negated(a) => {
+                let code_a = a.generate_code2(data);
+                data.reuse_code(format!("(-{})", code_a))
+            }
+            Expression::Sum(a, b) => {
+                let code_a = a.generate_code2(data);
+                let code_b = b.generate_code2(data);
+                if code_a <= code_b {
+                    data.reuse_code(format!("({}+{})", code_a, code_b))
+                } else {
+                    data.reuse_code(format!("({}+{})", code_b, code_a))
+                }
+            }
+            Expression::Product(a, b) => {
+                let code_a = a.generate_code2(data);
+                let code_b = b.generate_code2(data);
+                if code_a <= code_b {
+                    data.reuse_code(format!("({}*{})", code_a, code_b))
+                } else {
+                    data.reuse_code(format!("({}*{})", code_b, code_a))
+                }
+            }
+            Expression::Scaled(a, f) => {
+                if *f == F::zero() {
+                    "".to_string()
+                } else if *f == F::one() {
+                    format!("{}", a.generate_code2(data))
+                } else {
+                    let code_f = data.add_constant(f);
+                    let code_a = a.generate_code2(data);
+                    data.reuse_code(format!("{}*{}", code_a, code_f))
+                }
             }
         }
     }

@@ -1,7 +1,12 @@
+use ark_std::perf_trace::{TimerInfo, AtomicUsize, Ordering};
+use ark_std::{start_timer, end_timer};
 use ff::Field;
 use group::Curve;
-use std::iter;
+use std::time::Instant;
+use std::{iter, env::var};
 use std::ops::RangeTo;
+
+mod generated;
 
 use super::{
     circuit::{
@@ -11,6 +16,10 @@ use super::{
     lookup, permutation, vanishing, ChallengeBeta, ChallengeGamma, ChallengeTheta, ChallengeX,
     ChallengeY, Error, ProvingKey,
 };
+use crate::plonk::{CodeGenerationData, Expression};
+use crate::plonk::lookup::prover::{evaluate, Constructed};
+use crate::plonk::prover::generated::evaluate_hardcoded;
+use crate::poly::Rotation;
 use crate::poly::{
     commitment::Params,
     multiopen::{self, ProverQuery},
@@ -24,6 +33,92 @@ use crate::{
     poly::batch_invert_assigned,
     transcript::{EncodedChallenge, TranscriptWrite},
 };
+
+/// Temp
+#[allow(missing_debug_implementations)]
+pub struct MeasurementInfo {
+    /// Temp
+    pub measure: bool,
+    /// Temp
+    pub time: /*TimerInfo*/Instant,
+    /// Message
+    pub message: String,
+    /// Indent
+    pub indent: usize,
+}
+
+/// TEMP
+pub static NUM_INDENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Temp
+pub fn start_measure(msg: String) -> MeasurementInfo {
+    let measure: u32 = var("MEASURE")
+    .expect("No MEASURE env var was provided")
+    .parse()
+    .expect("Cannot parse MEASURE env var as u32");
+
+    let indent = NUM_INDENT.fetch_add(1, Ordering::Relaxed);
+
+    if measure == 1/* || msg.starts_with("compressed_cosets")*/ {
+        MeasurementInfo {
+            measure: true,
+            time: /*start_timer!(|| msg)*/Instant::now(),
+            message: msg,
+            indent,
+        }
+    } else {
+        MeasurementInfo {
+            measure: false,
+            time: /*TimerInfo {
+                msg: "".to_string(),
+                time: Instant::now(),
+            }*/Instant::now(),
+            message: "".to_string(),
+            indent,
+        }
+    }
+}
+
+/// Temp
+pub fn stop_measure(info: MeasurementInfo) {
+    NUM_INDENT.fetch_sub(1, Ordering::Relaxed);
+
+    if info.measure {
+        let final_time = Instant::now() - info.time;
+        let secs = final_time.as_secs();
+        let millis = final_time.subsec_millis();
+        let micros = final_time.subsec_micros() % 1000;
+        //let nanos = final_time.subsec_nanos() % 1000;
+        /*let out = if secs != 0 {
+            format!("{}.{:03}s", secs, millis)
+        } else if millis > 0 {
+            format!("{}.{:03}ms", millis, micros)
+        } else {
+            ""
+        };*/
+
+        //if secs > 0 || millis >= 1 {
+            println!("{}{} ........ {}.{:03}{:03}s", "*".repeat(info.indent), info.message, secs, millis, micros);
+        //}
+
+        //end_timer!(info.time);
+    }
+}
+
+/// Get env variable
+pub fn env_value(key: &str, default: usize) -> usize {
+    match var(key) {
+        Ok(val) => val.parse().unwrap(),
+        Err(_) => default,
+    }
+}
+
+/// Temp
+pub fn log_info(msg: String) {
+    if env_value("INFO", 0) != 0 {
+        println!("{}", msg);
+    }
+}
 
 /// This creates a proof for the provided `circuit` when given the public
 /// parameters `params` and the proving key [`ProvingKey`] that was
@@ -41,6 +136,8 @@ pub fn create_proof<
     instances: &[&[&[C::Scalar]]],
     transcript: &mut T,
 ) -> Result<(), Error> {
+    use ark_std::{end_timer, start_timer};
+
     for instance in instances.iter() {
         if instance.len() != pk.vk.cs.num_instance_columns {
             return Err(Error::InvalidInstances);
@@ -58,12 +155,100 @@ pub fn create_proof<
     // from the verification key.
     let meta = &pk.vk.cs;
 
+    let generate_code = false;
+    if generate_code {
+        let mut code_data = CodeGenerationData {
+            results: vec![],
+            constants: vec![],
+            rotations: vec![],
+        };
+        let mut post_code = "".to_string();
+
+        //let mut value_update = "F::zero()".to_string();
+        for gate in meta.gates.iter() {
+            for poly in gate.polynomials().iter() {
+                let value = poly.generate_code2(&mut code_data);
+                // value_update = format!("({} * y + {})", value_update, value);
+                post_code += &format!("*value = *value * y + {};\n", value)
+            }
+        }
+        // post_code += &format!("*value = {};\n\n", value_update);
+
+        // + (product_coset[r_0] * (permuted_input_coset[idx] + beta) * (permuted_table_coset[idx] + gamma)  * active_rows * Yn)
+        //- (product_coset[idx] * VALUE * active_rows * Yn);
+        // (product_coset[0] * VALUE[0] * active_rows[0] * Yn[0]) + (product_coset[1] * VALUE[1] * active_rows[1] * Yn[1])
+
+        post_code += &format!("let active_rows = one - (l_last[idx] + l_blind[idx]);\n");
+        for (n, lookup) in pk.vk.cs.lookups.iter().enumerate() {
+            post_code += &format!("let product_coset = &product_cosets[{}].values;\n", n);
+            post_code += &format!("let permuted_input_coset = &permuted_input_cosets[{}].values;\n", n);
+            post_code += &format!("let permuted_table_coset = &permuted_table_cosets[{}].values;\n", n);
+            post_code += &format!("let a_minus_s = permuted_input_coset[idx] - permuted_table_coset[idx];\n");
+
+            // Input coset
+            let mut compressed_input_coset = lookup.input_expressions[0].generate_code2(&mut code_data);
+            for expr in lookup.input_expressions.iter().skip(1) {
+                let expr_value = expr.generate_code2(&mut code_data);
+                compressed_input_coset = code_data.reuse_code(format!("({} * theta + {})", compressed_input_coset, expr_value));
+            }
+
+            /*post_code += &format!("let mut compressed_input_coset = F::zero();\n");
+            for expr in lookup.input_expressions.iter() {
+                let value = expr.generate_code2(&mut code_data);
+                post_code += &format!("compressed_input_coset = compressed_input_coset * theta + {};\n", value);
+            }*/
+
+            // table coset
+            let mut compressed_table_coset = lookup.table_expressions[0].generate_code2(&mut code_data);
+            for expr in lookup.table_expressions.iter().skip(1) {
+                let expr_value = expr.generate_code2(&mut code_data);
+                compressed_table_coset = code_data.reuse_code(format!("({} * theta + {})", compressed_table_coset, expr_value));
+            }
+
+            // l_0(X) * (1 - z(X)) = 0
+            // Polynomial::one_minus(self.product_coset.clone()) * &pk.l0,
+            let value = &format!("(one - product_coset[idx]) * l0[idx]");
+            post_code += &format!("*value = *value * y + ({});\n", value);
+
+            // l_last(X) * (z(X)^2 - z(X)) = 0
+            // (self.product_coset.clone() * &self.product_coset - &self.product_coset) * &pk.l_last
+            let value = &format!("(product_coset[idx] * product_coset[idx] - product_coset[idx]) * l_last[idx]");
+            post_code += &format!("*value = *value * y + ({});\n", value);
+
+            // (1 - (l_last(X) + l_blind(X))) * (
+            //   z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
+            //   - z(X) (\theta^{m-1} a_0(X) + ... + a_{m-1}(X) + \beta) (\theta^{m-1} s_0(X) + ... + s_{m-1}(X) + \gamma)
+            // ) = 0
+            let next = code_data.add_rotation(&Rotation::next());
+            // z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
+            let left = format!("product_coset[{}] * (permuted_input_coset[idx] + beta) * (permuted_table_coset[idx] + gamma)", next);
+            // z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
+            let right_gamma = code_data.reuse_code(format!("({} + gamma)", compressed_table_coset));
+            let right = format!("product_coset[idx] * ({} + beta) * {}", compressed_input_coset, right_gamma);
+            let value = &format!("({} - {}) * active_rows", left, right);
+            post_code += &format!("*value = *value * y + ({});\n", value);
+
+            // l_0(X) * (a'(X) - s'(X)) = 0
+            // (permuted.permuted_input_coset.clone() - &permuted.permuted_table_coset) * &pk.l0
+            let value = &format!("a_minus_s * l0[idx]");
+            post_code += &format!("*value = *value * y + ({});\n", value);
+
+            // (1 - (l_last + l_blind)) * (a′(X) − s′(X))⋅(a′(X) − a′(\omega^{-1} X)) = 0
+            let prev = code_data.add_rotation(&Rotation::prev());
+            let value = &format!("a_minus_s * (permuted_input_coset[idx] - permuted_input_coset[{}]) * active_rows", prev);
+            post_code += &format!("*value = *value * y + ({});\n", value);
+        }
+        let code = code_data.get_code(post_code);
+        println!("{}", code);
+    }
+
     struct InstanceSingle<C: CurveAffine> {
         pub instance_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
         pub instance_polys: Vec<Polynomial<C::Scalar, Coeff>>,
         pub instance_cosets: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
     }
 
+    let start = start_timer!(|| "instance");
     let instance: Vec<InstanceSingle<C>> = instances
         .iter()
         .map(|instance| -> Result<InstanceSingle<C>, Error> {
@@ -115,6 +300,7 @@ pub fn create_proof<
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(start);
 
     struct AdviceSingle<C: CurveAffine> {
         pub advice_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
@@ -122,6 +308,7 @@ pub fn create_proof<
         pub advice_cosets: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
     }
 
+    let start = start_timer!(|| "advice");
     let advice: Vec<AdviceSingle<C>> = circuits
         .iter()
         .zip(instances.iter())
@@ -319,16 +506,19 @@ pub fn create_proof<
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(start);
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: ChallengeTheta<_> = transcript.squeeze_challenge_scalar();
 
+    let start = start_timer!(|| format!("lookups commit_permuted {}", instance.len()));
     let lookups: Vec<Vec<lookup::prover::Permuted<C>>> = instance
         .iter()
         .zip(advice.iter())
         .map(|(instance, advice)| -> Result<Vec<_>, Error> {
             // Construct and commit to permuted values for each lookup
-            pk.vk
+            let start = start_timer!(|| format!("lookups commit_permuted {}", pk.vk.cs.lookups.len()));
+            let ret = pk.vk
                 .cs
                 .lookups
                 .iter()
@@ -341,15 +531,15 @@ pub fn create_proof<
                         &advice.advice_values,
                         &pk.fixed_values,
                         &instance.instance_values,
-                        &advice.advice_cosets,
-                        &pk.fixed_cosets,
-                        &instance.instance_cosets,
                         transcript,
                     )
                 })
-                .collect()
+                .collect();
+            end_timer!(start);
+            ret
         })
         .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(start);
 
     // Sample beta challenge
     let beta: ChallengeBeta<_> = transcript.squeeze_challenge_scalar();
@@ -358,6 +548,7 @@ pub fn create_proof<
     let gamma: ChallengeGamma<_> = transcript.squeeze_challenge_scalar();
 
     // Commit to permutations.
+    let start = start_timer!(|| "permutations");
     let permutations: Vec<permutation::prover::Committed<C>> = instance
         .iter()
         .zip(advice.iter())
@@ -375,25 +566,62 @@ pub fn create_proof<
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(start);
 
+    let start = start_timer!(|| format!("lookups commit_product ({})", lookups.len()));
     let lookups: Vec<Vec<lookup::prover::Committed<C>>> = lookups
         .into_iter()
         .map(|lookups| -> Result<Vec<_>, _> {
+            let start = start_timer!(|| format!("lookup commit_product ({})", lookups.len()));
             // Construct and commit to products for each lookup
-            lookups
+            let res = lookups
                 .into_iter()
-                .map(|lookup| lookup.commit_product(pk, params, theta, beta, gamma, transcript))
-                .collect::<Result<Vec<_>, _>>()
+                .map(|lookup| lookup.commit_product(pk, params, beta, gamma, transcript))
+                .collect::<Result<Vec<_>, _>>();
+            end_timer!(start);
+            res
         })
         .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(start);
 
     // Commit to the vanishing argument's random polynomial for blinding h(x_3)
+    let start = start_timer!(|| "vanishing");
     let vanishing = vanishing::Argument::commit(params, domain, transcript)?;
+    end_timer!(start);
 
     // Obtain challenge for keeping all separate gates linearly independent
     let y: ChallengeY<_> = transcript.squeeze_challenge_scalar();
 
+    let start = start_timer!(|| format!("temp memcopies"));
+    let (product_cosets, (permuted_input_cosets, permuted_table_cosets)): (Vec<_>, (Vec<_>, Vec<_>)) = lookups[0]
+        .iter()
+        .map(|lookup| (&lookup.product_coset, (&lookup.permuted_input_coset, &lookup.permuted_table_coset)))
+        .unzip();
+    end_timer!(start);
+    let start = start_timer!(|| format!("h(X) poly optimized ({})", lookups[0].len()));
+    let h_poly = pk.vk.domain.lagrange_from_vec_ext(
+        evaluate_hardcoded(
+            domain.extended_len(),
+            1 << (domain.extended_k - params.k),
+            &pk.fixed_cosets,
+            &advice[0].advice_cosets,
+            &instance[0].instance_cosets,
+            *y,
+            *beta,
+            *gamma,
+            *theta,
+            &pk.l0,
+            &pk.l_blind,
+            &pk.l_last,
+            &product_cosets,
+            &permuted_input_cosets,
+            &permuted_table_cosets,
+        )
+    );
+    end_timer!(start);
+
     // Evaluate the h(X) polynomial's constraint system expressions for the permutation constraints.
+    let start = start_timer!(|| "h(X) permutations");
     let (permutations, permutation_expressions): (Vec<_>, Vec<_>) = permutations
         .into_iter()
         .zip(advice.iter())
@@ -411,70 +639,120 @@ pub fn create_proof<
             )
         })
         .unzip();
+    end_timer!(start);
 
-    let (lookups, lookup_expressions): (Vec<Vec<_>>, Vec<Vec<_>>) = lookups
+    let verify_optimizations = false;
+    if verify_optimizations {
+        let start = start_timer!(|| format!("lookups commit_permuted {}", instance.len()));
+        let compressed_cosets: Vec<Vec<lookup::prover::PermutedCosets<C>>> = instance
+            .iter()
+            .zip(advice.iter())
+            .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+                // Construct and commit to permuted values for each lookup
+                let start = start_timer!(|| format!("lookups commit_permuted cosets {}", pk.vk.cs.lookups.len()));
+                let ret = pk.vk
+                    .cs
+                    .lookups
+                    .iter()
+                    .map(|lookup| {
+                        lookup.commit_permuted_coset(
+                            pk,
+                            params,
+                            domain,
+                            theta,
+                            &advice.advice_cosets,
+                            &pk.fixed_cosets,
+                            &instance.instance_cosets,
+                        )
+                    })
+                    .collect();
+                end_timer!(start);
+                ret
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        end_timer!(start);
+
+        let start = start_timer!(|| format!("h(X) lookups ({})", lookups.len()));
+        let lookup_expressions: Vec<Vec<_>> = lookups
+            .iter()
+            .zip(compressed_cosets.into_iter())
+            .map(|(lookups, compressed_cosets)| {
+                let start = start_timer!(|| format!("h(X) lookups int ({})", lookups.len()));
+                // Evaluate the h(X) polynomial's constraint system expressions for the lookup constraints, if any.
+                let res = lookups
+                    .iter()
+                    .zip(compressed_cosets.into_iter())
+                    .map(|(p, cc)| p.construct_expressions(pk, beta, gamma, cc))
+                    .collect();
+                end_timer!(start);
+                res
+            })
+            .collect();
+        end_timer!(start);
+
+        //println!("advice.len: {}", advice.len());
+        //println!("permutation_expressions.len: {}", permutation_expressions.len());
+        //println!("lookup_expressions.len: {}", lookup_expressions.len());
+        let expressions = advice
+            .iter()
+            .zip(instance.iter())
+            .zip(permutation_expressions.into_iter())
+            .zip(lookup_expressions.into_iter())
+            .flat_map(
+                |(((advice, instance), permutation_expressions), lookup_expressions)| {
+                    iter::empty()
+                        // Custom constraints
+                        .chain(meta.gates.iter().flat_map(move |gate| {
+                            gate.polynomials().iter().map(move |poly| {
+                                pk.vk.domain.lagrange_from_vec_ext(
+                                evaluate(
+                                        &pk.vk.domain,
+                                        &poly,
+                                        domain.extended_len(),
+                                        1 << (domain.extended_k - params.k),
+                                        &pk.fixed_cosets,
+                                        &advice.advice_cosets,
+                                        &instance.instance_cosets,
+                                    ),
+                                )
+                            })
+                        }))
+                        // Permutation constraints, if any.
+                        .chain(permutation_expressions.into_iter())
+                        // Lookup constraints, if any.
+                        .chain(lookup_expressions.into_iter().flatten())
+                },
+            );
+
+        let h_poly_b = expressions.fold(domain.empty_extended(), |h_poly, v| h_poly * *y + &v);
+        for idx in 0..h_poly.values.len() {
+            if h_poly.values[idx] != h_poly_b.values[idx] {
+                println!("*Incorrect Value: {:?} , {:?}", h_poly.values[idx], h_poly_b.values[idx]);
+            }
+        }
+    }
+
+    // Construct the vanishing argument's h(X) commitments
+    let start = start_timer!(|| "h(X) vanishing");
+    let vanishing = vanishing.construct(params, domain, h_poly, transcript)?;
+    end_timer!(start);
+
+    let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
+    let xn = x.pow(&[params.n as u64, 0, 0, 0]);
+
+    let lookups: Vec<Vec<Constructed<C>>> = lookups
         .into_iter()
         .map(|lookups| {
             // Evaluate the h(X) polynomial's constraint system expressions for the lookup constraints, if any.
             lookups
                 .into_iter()
-                .map(|p| p.construct(pk, theta, beta, gamma))
-                .unzip()
+                .map(|p| p.construct())
+                .collect::<Vec<_>>()
         })
-        .unzip();
-
-    let expressions = advice
-        .iter()
-        .zip(instance.iter())
-        .zip(permutation_expressions.into_iter())
-        .zip(lookup_expressions.into_iter())
-        .flat_map(
-            |(((advice, instance), permutation_expressions), lookup_expressions)| {
-                iter::empty()
-                    // Custom constraints
-                    .chain(meta.gates.iter().flat_map(move |gate| {
-                        gate.polynomials().iter().map(move |poly| {
-                            poly.evaluate(
-                                &|scalar| pk.vk.domain.constant_extended(scalar),
-                                &|_| panic!("virtual selectors are removed during optimization"),
-                                &|_, column_index, rotation| {
-                                    pk.vk
-                                        .domain
-                                        .rotate_extended(&pk.fixed_cosets[column_index], rotation)
-                                },
-                                &|_, column_index, rotation| {
-                                    pk.vk.domain.rotate_extended(
-                                        &advice.advice_cosets[column_index],
-                                        rotation,
-                                    )
-                                },
-                                &|_, column_index, rotation| {
-                                    pk.vk.domain.rotate_extended(
-                                        &instance.instance_cosets[column_index],
-                                        rotation,
-                                    )
-                                },
-                                &|a| -a,
-                                &|a, b| a + &b,
-                                &|a, b| a * &b,
-                                &|a, scalar| a * scalar,
-                            )
-                        })
-                    }))
-                    // Permutation constraints, if any.
-                    .chain(permutation_expressions.into_iter())
-                    // Lookup constraints, if any.
-                    .chain(lookup_expressions.into_iter().flatten())
-            },
-        );
-
-    // Construct the vanishing argument's h(X) commitments
-    let vanishing = vanishing.construct(params, domain, expressions, y, transcript)?;
-
-    let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
-    let xn = x.pow(&[params.n as u64, 0, 0, 0]);
+        .collect::<Vec<_>>();
 
     // Compute and hash instance evals for each circuit instance
+    let start = start_timer!(|| "instance evals");
     for instance in instance.iter() {
         // Evaluate polynomials at omega^i x
         let instance_evals: Vec<_> = meta
@@ -493,8 +771,10 @@ pub fn create_proof<
             transcript.write_scalar(*eval)?;
         }
     }
+    end_timer!(start);
 
     // Compute and hash advice evals for each circuit instance
+    let start = start_timer!(|| "hash evals");
     for advice in advice.iter() {
         // Evaluate polynomials at omega^i x
         let advice_evals: Vec<_> = meta
@@ -513,8 +793,10 @@ pub fn create_proof<
             transcript.write_scalar(*eval)?;
         }
     }
+    end_timer!(start);
 
     // Compute and hash fixed evals (shared across all circuit instances)
+    let start = start_timer!(|| "fixed evals");
     let fixed_evals: Vec<_> = meta
         .fixed_queries
         .iter()
@@ -522,6 +804,7 @@ pub fn create_proof<
             eval_polynomial(&pk.fixed_polys[column.index()], domain.rotate_omega(*x, at))
         })
         .collect();
+    end_timer!(start);
 
     // Hash each fixed column evaluation
     for eval in fixed_evals.iter() {
@@ -534,21 +817,28 @@ pub fn create_proof<
     pk.permutation.evaluate(x, transcript)?;
 
     // Evaluate the permutations, if any, at omega^i x.
+    let start = start_timer!(|| format!("eval permutations ({})", permutations.len()));
     let permutations: Vec<permutation::prover::Evaluated<C>> = permutations
         .into_iter()
         .map(|permutation| -> Result<_, _> { permutation.evaluate(pk, x, transcript) })
         .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(start);
 
     // Evaluate the lookups, if any, at omega^i x.
+    let start = start_timer!(|| format!("eval lookups ({})", lookups.len()));
     let lookups: Vec<Vec<lookup::prover::Evaluated<C>>> = lookups
         .into_iter()
         .map(|lookups| -> Result<Vec<_>, _> {
-            lookups
+            let start = start_timer!(|| format!("eval lookups int ({})", lookups.len()));
+            let res = lookups
                 .into_iter()
                 .map(|p| p.evaluate(pk, x, transcript))
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<Result<Vec<_>, _>>();
+            end_timer!(start);
+            res
         })
         .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(start);
 
     let instances = instance
         .iter()
@@ -594,5 +884,9 @@ pub fn create_proof<
         // We query the h(X) polynomial at x
         .chain(vanishing.open(x));
 
-    multiopen::create_proof(params, transcript, instances).map_err(|_| Error::Opening)
+    let start = start_timer!(|| "create_proof");
+    let proof = multiopen::create_proof(params, transcript, instances).map_err(|_| Error::Opening);
+    end_timer!(start);
+
+    proof
 }
