@@ -49,7 +49,7 @@ pub(in crate::plonk) struct PermutedCosets<C: CurveAffine> {
 }
 
 #[derive(Clone,Debug)]
-pub(in crate::plonk) struct Committed<C: CurveAffine> {
+pub/*(in crate::plonk)*/ struct Committed<C: CurveAffine> {
     /// Temp
     pub permuted_input_coset: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
     /// Temp
@@ -99,12 +99,13 @@ impl<F: FieldExt> Argument<F> {
         fixed_values: &'a [Polynomial<C::Scalar, LagrangeCoeff>],
         instance_values: &'a [Polynomial<C::Scalar, LagrangeCoeff>],
         transcript: &mut T,
+        verify: bool,
     ) -> Result<Permuted<C>, Error>
     where
         C: CurveAffine<ScalarExt = F>,
         C::Curve: Mul<F, Output = C::Curve> + MulAssign<F>,
     {
-        let start_general = start_measure(format!("commit_permuted"));
+        let start_general = start_measure(format!("commit_permuted"), false);
 
         // Closure to get values of expressions and compress them
         let compress_expressions = |expressions: &[Expression<C::Scalar>]| {
@@ -135,21 +136,21 @@ impl<F: FieldExt> Argument<F> {
                 });
             stop_measure(start);*/
 
-            let start = start_measure(format!("compressed_expression ({})", expressions.len()));
+            let start = start_measure(format!("compressed_expression ({})", expressions.len()), false);
             let compressed_expression = expressions
                 .iter()
                 .map(|expression| {
                     pk.vk.domain.lagrange_from_vec(
                         evaluate(
-                                &pk.vk.domain,
-                                &expression,
+                            &pk.vk.domain,
+                            &expression,
                             params.n as usize,
                             1,
                             fixed_values,
-                             advice_values,
-                              instance_values,
-                            ),
-                        )
+                            advice_values,
+                            instance_values,
+                        ),
+                    )
                 })
                 .fold(domain.empty_lagrange(), |acc, expression| {
                     acc * *theta + &expression
@@ -232,17 +233,17 @@ impl<F: FieldExt> Argument<F> {
         };
 
         // Get values of input expressions involved in the lookup and compress them
-        let start = start_measure(format!("compress inputs"));
+        let start = start_measure(format!("compress inputs"), false);
         let compressed_input_expression = compress_expressions(&self.input_expressions);
         stop_measure(start);
 
         // Get values of table expressions involved in the lookup and compress them
-        let start = start_measure(format!("compress tables"));
+        let start = start_measure(format!("compress tables"), false);
         let compressed_table_expression = compress_expressions(&self.table_expressions);
         stop_measure(start);
 
         // Permute compressed (InputExpression, TableExpression) pair
-        let start = start_measure(format!("permute"));
+        let start = start_measure(format!("permute"), false);
         let (permuted_input_expression, permuted_table_expression) = permute_expression_pair::<C>(
             pk,
             params,
@@ -253,13 +254,13 @@ impl<F: FieldExt> Argument<F> {
         stop_measure(start);
 
         // Commit to permuted input expression
-        let start = start_measure(format!("commit inputs"));
+        let start = start_measure(format!("commit inputs"), false);
         let (permuted_input_poly, permuted_input_commitment) =
             commit_values(&permuted_input_expression);
         stop_measure(start);
 
         // Commit to permuted table expression
-        let start = start_measure(format!("commit tables"));
+        let start = start_measure(format!("commit tables"), false);
         let (permuted_table_poly, permuted_table_commitment) =
             commit_values(&permuted_table_expression);
         stop_measure(start);
@@ -270,11 +271,12 @@ impl<F: FieldExt> Argument<F> {
         // Hash permuted table commitment
         transcript.write_point(permuted_table_commitment)?;
 
-        let start = start_measure(format!("input coset"));
-        let permuted_input_coset = pk.vk.domain.coeff_to_extended(permuted_input_poly.clone());
+        // TODO: remove
+        let start = start_measure(format!("input coset"), false);
+        let permuted_input_coset = if verify {pk.vk.domain.coeff_to_extended(permuted_input_poly.clone()) } else { pk.vk.domain.lagrange_from_vec_ext(vec![]) };
         stop_measure(start);
-        let start = start_measure(format!("table coset"));
-        let permuted_table_coset = pk.vk.domain.coeff_to_extended(permuted_table_poly.clone());
+        let start = start_measure(format!("table coset"), false);
+        let permuted_table_coset = if verify {pk.vk.domain.coeff_to_extended(permuted_table_poly.clone()) } else { pk.vk.domain.lagrange_from_vec_ext(vec![]) };
         stop_measure(start);
 
         stop_measure(start_general);
@@ -340,12 +342,12 @@ impl<F: FieldExt> Argument<F> {
         };
 
         // Get values of input expressions involved in the lookup and compress them
-        let start = start_measure(format!("compress inputs coset"));
+        let start = start_measure(format!("compress inputs coset"), false);
         let compressed_input_coset = compress_expressions(&self.input_expressions);
         stop_measure(start);
 
         // Get values of table expressions involved in the lookup and compress them
-        let start = start_measure(format!("compress tables coset"));
+        let start = start_measure(format!("compress tables coset"), false);
         let compressed_table_coset = compress_expressions(&self.table_expressions);
         stop_measure(start);
 
@@ -369,8 +371,9 @@ impl<C: CurveAffine> Permuted<C> {
         beta: ChallengeBeta<C>,
         gamma: ChallengeGamma<C>,
         transcript: &mut T,
+        verify: bool,
     ) -> Result<Committed<C>, Error> {
-        let start = start_measure(format!("commit_product({})", 0));
+        let start = start_measure(format!("commit_product({})", 0), false);
         let blinding_factors = pk.vk.cs.blinding_factors();
         // Goal is to compute the products of fractions
         //
@@ -479,11 +482,14 @@ impl<C: CurveAffine> Permuted<C> {
             assert_eq!(z[u], C::Scalar::one());
         }
         let product_commitment = params.commit_lagrange(&z).to_affine();
-        let z = pk.vk.domain.lagrange_to_coeff(z);
-        let product_coset = pk.vk.domain.coeff_to_extended(z.clone());
 
         // Hash product commitment
         transcript.write_point(product_commitment)?;
+
+        let z = pk.vk.domain.lagrange_to_coeff(z);
+
+        // TODO: remove
+        let product_coset = if verify { pk.vk.domain.coeff_to_extended(z.clone()) } else { pk.vk.domain.lagrange_from_vec_ext(vec![]) };
 
         stop_measure(start);
 
@@ -763,6 +769,9 @@ fn permute_expression_pair<C: CurveAffine>(
     ))
 }
 
+/// TEMP
+pub static mut EVALUATE_TOTAL_TIME: usize = 0;
+
 pub fn evaluate<F: FieldExt, B: Basis>(
     domain: &EvaluationDomain<F>,
     expression: &Expression<F>,
@@ -772,8 +781,8 @@ pub fn evaluate<F: FieldExt, B: Basis>(
     advice: &[Polynomial<F, B>],
     instance: &[Polynomial<F, B>],
 ) -> Vec<F> {
-    let code = expression.generate_code();
-    log_info(format!("Expression: {}", expression.generate_code()));
+    //let code = expression.generate_code();
+    //log_info(format!("Expression: {}", expression.generate_code()));
 
     /*let start = start_timer!(|| format!("expression normal"));
 
@@ -832,7 +841,7 @@ pub fn evaluate<F: FieldExt, B: Basis>(
     }
     end_timer!(start);*/
 
-    let start = start_measure(format!("expression opt"));
+    let start = start_measure(format!("expression opt"), false);
     let mut values = vec![F::zero(); size];
 
     parallelize(&mut values, |values, start| {
@@ -861,7 +870,12 @@ pub fn evaluate<F: FieldExt, B: Basis>(
             );
         }
     });
-    stop_measure(start);
+    let duration = stop_measure(start);
+
+    #[allow(unsafe_code)]
+    unsafe {
+        EVALUATE_TOTAL_TIME += duration;
+    }
 
     values
 }

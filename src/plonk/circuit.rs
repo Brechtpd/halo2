@@ -650,15 +650,17 @@ pub enum Expression<F> {
     } else if v == F::one() {
         "one".to_string()
     } else {
-        format!("F::from_bytes(&decode_hex(\"{:?}\").try_into().unwrap()).unwrap()", v).to_string()
+        format!("C::ScalarExt::from_bytes(&decode_hex(\"{:?}\").try_into().unwrap()).unwrap()", v).to_string()
     }
 }
 
 /// Temp
 #[derive(Debug)]
 pub struct CodeInfo {
-    code: String,
-    counter: usize,
+    /// Temp
+    pub code: String,
+    /// Temp
+    pub counter: usize,
 }
 
 /// Temp
@@ -718,53 +720,6 @@ impl<F: Field> CodeGenerationData<F> {
             };
             format!("<{}>", idx)
         }
-    }
-
-    /// Generates optimized code for the expression
-    pub fn get_code(&self, post_code: String) -> String {
-        let mut code = "".to_string();
-        for (idx, c) in self.constants.iter().enumerate() {
-            code += &format!("let c_{} = {};\n", idx, scalar_to_string::<F>(*c));
-        }
-
-        code += "parallelize(&mut values, |values, start| {\n";
-        code += "let isize = size as i32;\n";
-        code += "for (i, value) in values.iter_mut().enumerate() {\n";
-        code += "let idx = i + start;\n\n";
-
-        for (idx, c) in self.rotations.iter().enumerate() {
-            code += &format!("let r_{} = (((idx as i32) + ({} * rot_scale)).rem_euclid(isize)) as usize;\n", idx, c);
-        }
-
-        let write_code = |code: &String| {
-            let mut out = "".to_string();
-            for c in code.chars() {
-                if c == '<' {
-                    out += &"i_";
-                } else if c == '>' {
-                    // don't do anything
-                } else {
-                    out += &c.to_string();
-                }
-            }
-            out
-        };
-
-        for (idx, c) in self.results.iter().enumerate() {
-            let mut part = write_code(&c.code);
-            if part.starts_with("(") && part.ends_with(")") {
-                part = part[1..part.len()-1].to_string();
-            }
-            code += &format!("let i_{} = {};  // {}\n", idx, part, c.counter);
-        }
-        code += "\n\n";
-
-        code += &write_code(&post_code);
-
-        code += "}\n";
-        code += "});\n\n";
-
-        code
     }
 }
 
@@ -1131,25 +1086,53 @@ impl<F: Field> Expression<F> {
                 }
             }
             Expression::Negated(a) => {
-                let code_a = a.generate_code2(data);
-                data.reuse_code(format!("(-{})", code_a))
+                match **a {
+                    Expression::Constant(scalar) => {
+                        data.add_constant(&-scalar)
+                    }
+                    _ => {
+                        let code_a = a.generate_code2(data);
+                        if code_a == "c_0" {
+                            code_a
+                        } else {
+                            data.reuse_code(format!("(-{})", code_a))
+                        }
+                    }
+                }
             }
             Expression::Sum(a, b) => {
                 let code_a = a.generate_code2(data);
                 let code_b = b.generate_code2(data);
-                if code_a <= code_b {
-                    data.reuse_code(format!("({}+{})", code_a, code_b))
+                if code_a == "c_0" {
+                    code_b
+                } else if code_b == "c_0" {
+                    code_a
                 } else {
-                    data.reuse_code(format!("({}+{})", code_b, code_a))
+                    if code_a <= code_b {
+                        data.reuse_code(format!("({}+{})", code_a, code_b))
+                    } else {
+                        data.reuse_code(format!("({}+{})", code_b, code_a))
+                    }
                 }
             }
             Expression::Product(a, b) => {
                 let code_a = a.generate_code2(data);
                 let code_b = b.generate_code2(data);
-                if code_a <= code_b {
-                    data.reuse_code(format!("({}*{})", code_a, code_b))
+
+                if code_a == "c_0" || code_b == "c_0" {
+                    "c_0".to_string()
                 } else {
-                    data.reuse_code(format!("({}*{})", code_b, code_a))
+                    if code_a == "c_1" {
+                        code_b
+                    } else if code_b == "c_1" {
+                        code_a
+                    } else {
+                        if code_a <= code_b {
+                            data.reuse_code(format!("({}*{})", code_a, code_b))
+                        } else {
+                            data.reuse_code(format!("({}*{})", code_b, code_a))
+                        }
+                    }
                 }
             }
             Expression::Scaled(a, f) => {

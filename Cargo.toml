@@ -40,6 +40,7 @@ pairing = { git = 'https://github.com/appliedzkp/pairing', package = "pairing_bn
 rand_core = { version = "0.6", default-features = false }
 subtle = "2.3"
 ark-std = { version = "0.3", features = ["print-trace"] }
+itertools = "0.8.0"
 
 
 # Developer tooling dependencies

@@ -16,8 +16,10 @@ use super::{
     lookup, permutation, vanishing, ChallengeBeta, ChallengeGamma, ChallengeTheta, ChallengeX,
     ChallengeY, Error, ProvingKey,
 };
-use crate::plonk::{CodeGenerationData, Expression};
-use crate::plonk::lookup::prover::{evaluate, Constructed};
+use crate::arithmetic::parallelize;
+use crate::multicore;
+use crate::plonk::{CodeGenerationData, Expression, scalar_to_string};
+use crate::plonk::lookup::prover::{evaluate, Constructed, EVALUATE_TOTAL_TIME};
 use crate::plonk::prover::generated::evaluate_hardcoded;
 use crate::poly::Rotation;
 use crate::poly::{
@@ -51,7 +53,27 @@ pub struct MeasurementInfo {
 pub static NUM_INDENT: AtomicUsize = AtomicUsize::new(0);
 
 /// Temp
-pub fn start_measure(msg: String) -> MeasurementInfo {
+pub fn get_time() -> Instant {
+    Instant::now()
+}
+
+/// Temp
+pub fn get_duration(start: Instant) -> usize {
+    let final_time = Instant::now() - start;
+    let secs = final_time.as_secs() as usize;
+    let millis = final_time.subsec_millis() as usize;
+    let micros = (final_time.subsec_micros() % 1000) as usize;
+    secs * 1000000 + millis * 1000 + micros
+}
+
+/// Temp
+pub fn log_measurement(indent: Option<usize>, msg: String, duration: usize) {
+    let indent = indent.unwrap_or(0);
+    println!("{}{} ........ {}s", "*".repeat(indent), msg, (duration as f32)/1000000.0);
+}
+
+/// Temp
+pub fn start_measure(msg: String, always: bool) -> MeasurementInfo {
     let measure: u32 = var("MEASURE")
     .expect("No MEASURE env var was provided")
     .parse()
@@ -59,20 +81,17 @@ pub fn start_measure(msg: String) -> MeasurementInfo {
 
     let indent = NUM_INDENT.fetch_add(1, Ordering::Relaxed);
 
-    if measure == 1/* || msg.starts_with("compressed_cosets")*/ {
+    if always || measure == 1/* || msg.starts_with("compressed_cosets")*/ {
         MeasurementInfo {
             measure: true,
-            time: /*start_timer!(|| msg)*/Instant::now(),
+            time: get_time(),
             message: msg,
             indent,
         }
     } else {
         MeasurementInfo {
             measure: false,
-            time: /*TimerInfo {
-                msg: "".to_string(),
-                time: Instant::now(),
-            }*/Instant::now(),
+            time: get_time(),
             message: "".to_string(),
             indent,
         }
@@ -80,29 +99,13 @@ pub fn start_measure(msg: String) -> MeasurementInfo {
 }
 
 /// Temp
-pub fn stop_measure(info: MeasurementInfo) {
+pub fn stop_measure(info: MeasurementInfo) -> usize {
     NUM_INDENT.fetch_sub(1, Ordering::Relaxed);
-
+    let duration = get_duration(info.time);
     if info.measure {
-        let final_time = Instant::now() - info.time;
-        let secs = final_time.as_secs();
-        let millis = final_time.subsec_millis();
-        let micros = final_time.subsec_micros() % 1000;
-        //let nanos = final_time.subsec_nanos() % 1000;
-        /*let out = if secs != 0 {
-            format!("{}.{:03}s", secs, millis)
-        } else if millis > 0 {
-            format!("{}.{:03}ms", millis, micros)
-        } else {
-            ""
-        };*/
-
-        //if secs > 0 || millis >= 1 {
-            println!("{}{} ........ {}.{:03}{:03}s", "*".repeat(info.indent), info.message, secs, millis, micros);
-        //}
-
-        //end_timer!(info.time);
+        log_measurement(Some(info.indent), info.message, duration);
     }
+    duration
 }
 
 /// Get env variable
@@ -119,6 +122,9 @@ pub fn log_info(msg: String) {
         println!("{}", msg);
     }
 }
+
+use crate::poly::FFT_TOTAL_TIME;
+use crate::arithmetic::MULTIEXP_TOTAL_TIME;
 
 /// This creates a proof for the provided `circuit` when given the public
 /// parameters `params` and the proving key [`ProvingKey`] that was
@@ -138,6 +144,13 @@ pub fn create_proof<
 ) -> Result<(), Error> {
     use ark_std::{end_timer, start_timer};
 
+    #[allow(unsafe_code)]
+    unsafe {
+        FFT_TOTAL_TIME = 0;
+        MULTIEXP_TOTAL_TIME = 0;
+        EVALUATE_TOTAL_TIME = 0;
+    }
+
     for instance in instances.iter() {
         if instance.len() != pk.vk.cs.num_instance_columns {
             return Err(Error::InvalidInstances);
@@ -156,41 +169,80 @@ pub fn create_proof<
     let meta = &pk.vk.cs;
 
     let generate_code = false;
+    let verify = false;
+    let single_pass = false;
+
     if generate_code {
         let mut code_data = CodeGenerationData {
             results: vec![],
             constants: vec![],
             rotations: vec![],
         };
-        let mut post_code = "".to_string();
+        code_data.add_constant(&C::ScalarExt::zero());
+        code_data.add_constant(&C::ScalarExt::one());
+        let mut post_code = "let mut value = zero;\n".to_string();
 
         //let mut value_update = "F::zero()".to_string();
         for gate in meta.gates.iter() {
             for poly in gate.polynomials().iter() {
                 let value = poly.generate_code2(&mut code_data);
                 // value_update = format!("({} * y + {})", value_update, value);
-                post_code += &format!("*value = *value * y + {};\n", value)
+                post_code += &format!("value = value * y + {};\n", value)
             }
         }
         // post_code += &format!("*value = {};\n\n", value_update);
 
-        // + (product_coset[r_0] * (permuted_input_coset[idx] + beta) * (permuted_table_coset[idx] + gamma)  * active_rows * Yn)
-        //- (product_coset[idx] * VALUE * active_rows * Yn);
-        // (product_coset[0] * VALUE[0] * active_rows[0] * Yn[0]) + (product_coset[1] * VALUE[1] * active_rows[1] * Yn[1])
-
-        post_code += &format!("let active_rows = one - (l_last[idx] + l_blind[idx]);\n");
+        let rot_next = code_data.add_rotation(&Rotation::next());
+        let rot_prev = code_data.add_rotation(&Rotation::prev());
         for (n, lookup) in pk.vk.cs.lookups.iter().enumerate() {
-            post_code += &format!("let product_coset = &product_cosets[{}].values;\n", n);
-            post_code += &format!("let permuted_input_coset = &permuted_input_cosets[{}].values;\n", n);
-            post_code += &format!("let permuted_table_coset = &permuted_table_cosets[{}].values;\n", n);
-            post_code += &format!("let a_minus_s = permuted_input_coset[idx] - permuted_table_coset[idx];\n");
+            /*for (j, expr) in lookup.input_expressions.iter().enumerate() {
+                let code = expr.generate_code();
+                println!("i{},{}: {}", n, j, code);
+            }
+            for (j, expr) in lookup.table_expressions.iter().enumerate() {
+                let code = expr.generate_code();
+                println!("t{},{}: {}", n, j, code);
+            }*/
+
+            let write_lc = |code_data: &mut CodeGenerationData<_>, parts: Vec<String>| {
+                let mut lc = parts[0].clone();
+                let mut num_skipped = 0;
+                for part in parts.iter().skip(1) {
+                    if part == "c_0" {
+                        num_skipped += 1;
+                    } else {
+                        if num_skipped == 0 {
+                            lc = code_data.reuse_code(format!("({}*theta+{})", lc, part));
+                        } else {
+                            lc = code_data.reuse_code(format!("({}*theta{}+{})", lc, num_skipped, part));
+                        }
+                        num_skipped = 0;
+                    }
+                }
+                if num_skipped > 0 {
+                    if num_skipped == 1 {
+                        lc = code_data.reuse_code(format!("({}*theta)", lc));
+                    } else {
+                        lc = code_data.reuse_code(format!("({}*theta{})", lc, num_skipped));
+                    }
+                }
+                lc
+            };
 
             // Input coset
-            let mut compressed_input_coset = lookup.input_expressions[0].generate_code2(&mut code_data);
+            let input_parts = lookup.input_expressions.iter().map(|expr| expr.generate_code2(&mut code_data)).collect();
+            let compressed_input_coset = write_lc(&mut code_data, input_parts);
+
+            // Input coset
+            /*let mut compressed_input_coset = lookup.input_expressions[0].generate_code2(&mut code_data);
             for expr in lookup.input_expressions.iter().skip(1) {
                 let expr_value = expr.generate_code2(&mut code_data);
-                compressed_input_coset = code_data.reuse_code(format!("({} * theta + {})", compressed_input_coset, expr_value));
-            }
+                if expr_value == "c_0" {
+                    compressed_input_coset = code_data.reuse_code(format!("({}*theta)", compressed_input_coset));
+                } else {
+                    compressed_input_coset = code_data.reuse_code(format!("({}*theta+{})", compressed_input_coset, expr_value));
+                }
+            }*/
 
             /*post_code += &format!("let mut compressed_input_coset = F::zero();\n");
             for expr in lookup.input_expressions.iter() {
@@ -199,46 +251,138 @@ pub fn create_proof<
             }*/
 
             // table coset
-            let mut compressed_table_coset = lookup.table_expressions[0].generate_code2(&mut code_data);
+            let table_parts = lookup.table_expressions.iter().map(|expr| expr.generate_code2(&mut code_data)).collect();
+            let compressed_table_coset = write_lc(&mut code_data, table_parts);
+            /*let mut compressed_table_coset = lookup.table_expressions[0].generate_code2(&mut code_data);
             for expr in lookup.table_expressions.iter().skip(1) {
                 let expr_value = expr.generate_code2(&mut code_data);
-                compressed_table_coset = code_data.reuse_code(format!("({} * theta + {})", compressed_table_coset, expr_value));
-            }
+                if expr_value == "c_0" {
+                    compressed_table_coset = code_data.reuse_code(format!("({}*theta)", compressed_table_coset));
+                } else {
+                    compressed_table_coset = code_data.reuse_code(format!("({}*theta+{})", compressed_table_coset, expr_value));
+                }
+            }*/
 
-            // l_0(X) * (1 - z(X)) = 0
-            // Polynomial::one_minus(self.product_coset.clone()) * &pk.l0,
-            let value = &format!("(one - product_coset[idx]) * l0[idx]");
-            post_code += &format!("*value = *value * y + ({});\n", value);
-
-            // l_last(X) * (z(X)^2 - z(X)) = 0
-            // (self.product_coset.clone() * &self.product_coset - &self.product_coset) * &pk.l_last
-            let value = &format!("(product_coset[idx] * product_coset[idx] - product_coset[idx]) * l_last[idx]");
-            post_code += &format!("*value = *value * y + ({});\n", value);
-
-            // (1 - (l_last(X) + l_blind(X))) * (
-            //   z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
-            //   - z(X) (\theta^{m-1} a_0(X) + ... + a_{m-1}(X) + \beta) (\theta^{m-1} s_0(X) + ... + s_{m-1}(X) + \gamma)
-            // ) = 0
-            let next = code_data.add_rotation(&Rotation::next());
-            // z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
-            let left = format!("product_coset[{}] * (permuted_input_coset[idx] + beta) * (permuted_table_coset[idx] + gamma)", next);
             // z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
             let right_gamma = code_data.reuse_code(format!("({} + gamma)", compressed_table_coset));
-            let right = format!("product_coset[idx] * ({} + beta) * {}", compressed_input_coset, right_gamma);
-            let value = &format!("({} - {}) * active_rows", left, right);
-            post_code += &format!("*value = *value * y + ({});\n", value);
 
-            // l_0(X) * (a'(X) - s'(X)) = 0
-            // (permuted.permuted_input_coset.clone() - &permuted.permuted_table_coset) * &pk.l0
-            let value = &format!("a_minus_s * l0[idx]");
-            post_code += &format!("*value = *value * y + ({});\n", value);
-
-            // (1 - (l_last + l_blind)) * (a′(X) − s′(X))⋅(a′(X) − a′(\omega^{-1} X)) = 0
-            let prev = code_data.add_rotation(&Rotation::prev());
-            let value = &format!("a_minus_s * (permuted_input_coset[idx] - permuted_input_coset[{}]) * active_rows", prev);
-            post_code += &format!("*value = *value * y + ({});\n", value);
+            if single_pass {
+                post_code += &format!("t[{}] = ({} + beta) * {};\n", n, compressed_input_coset, right_gamma);
+            } else {
+                post_code += &format!("t_{}[i] = ({} + beta) * {};\n", n, compressed_input_coset, right_gamma);
+            }
         }
-        let code = code_data.get_code(post_code);
+
+        let mut code = "\n".to_string();
+        if !single_pass {
+            code += "let start = start_measure(format!(\"Allocs\"), true);\n";
+            for idx in 0..pk.vk.cs.lookups.len() {
+                code += &format!("let mut table_values_{} = vec![C::Scalar::zero(); size];\n", idx);
+            }
+            code += "stop_measure(start);\n\n";
+        }
+
+        code += "let start = start_measure(format!(\"Core evaluation\"), true);\n";
+
+        for (idx, c) in code_data.constants.iter().enumerate() {
+            code += &format!("let c_{} = {};\n", idx, scalar_to_string::<C::Scalar>(*c));
+        }
+        code += "\n";
+
+        code += "let n = size;\n";
+        code += "let num_threads = multicore::current_num_threads();\n";
+        code += "let mut chunk = (n as usize) / num_threads;\n";
+        code += "if chunk < num_threads {\n";
+        code += "   chunk = n as usize;\n";
+        code += "}\n";
+        code += "\n";
+
+        let mut ts = "v".to_string();
+        let mut ps = "v".to_string();
+        code += "multicore::scope(|scope| {\n";
+        code += &format!("let v = values.chunks_mut(chunk);\n");
+        if !single_pass {
+            for idx in 0..pk.vk.cs.lookups.len() {
+                code += &format!("let p_{} = table_values_{}.chunks_mut(chunk);\n", idx, idx);
+                ts += &format!(", t_{}", idx);
+                ps += &format!(", p_{}", idx);
+            }
+            code += "\n";
+        }
+
+        code += &format!("for (j, ({})) in izip!({}).enumerate() {{\n", ts, ps);
+        code += "scope.spawn(move |_| {\n";
+        code += "let start = j * chunk;\n";
+
+        if single_pass {
+            code += &format!("let mut t = vec![zero; {}];\n", pk.vk.cs.lookups.len());
+        }
+
+        code += "for i in 0..v.len() {\n";
+        code += "let idx = i + start;\n\n";
+
+        for (idx, c) in code_data.rotations.iter().enumerate() {
+            code += &format!("let r_{} = (((idx as i32) + ({} * rot_scale)).rem_euclid(isize)) as usize;\n", idx, c);
+        }
+
+        let write_code = |code: &String| {
+            let mut out = "".to_string();
+            for c in code.chars() {
+                if c == '<' {
+                    out += &"i_";
+                } else if c == '>' {
+                    // don't do anything
+                } else {
+                    out += &c.to_string();
+                }
+            }
+            out
+        };
+
+        for (idx, c) in code_data.results.iter().enumerate() {
+            let mut part = write_code(&c.code);
+            if part.starts_with("(") && part.ends_with(")") {
+                part = part[1..part.len()-1].to_string();
+            }
+            code += &format!("let i_{} = {};  // {}\n", idx, part, c.counter);
+        }
+        code += "\n\n";
+
+        code += &write_code(&post_code);
+
+        if single_pass {
+            code += "for n in 0..num_lookups {\n";
+            code += "let product_coset = &product_cosets[n];\n";
+            code += "let permuted_input_coset = &permuted_input_cosets[n];\n";
+            code += "let permuted_table_coset = &permuted_table_cosets[n];\n";
+
+            code += "let a_minus_s = permuted_input_coset[idx] - permuted_table_coset[idx];\n";
+            code += "value = value * y + ((one - product_coset[idx]) * l0[idx]);\n";
+            code += "value = value * y + ((product_coset[idx] * product_coset[idx] - product_coset[idx]) * l_last[idx]);\n";
+            code += &format!("value = value * y + ((product_coset[{}] * (permuted_input_coset[idx] + beta) * (permuted_table_coset[idx] + gamma) - product_coset[idx] * t[n]) * l_active_row[idx]);\n", rot_next);
+            code += "value = value * y + (a_minus_s * l0[idx]);\n";
+            code += &format!("value = value * y + (a_minus_s * (permuted_input_coset[idx] - permuted_input_coset[{}]) * l_active_row[idx]);\n", rot_prev);
+            code += "}\n";
+        }
+
+        code += "v[i] = value;\n";
+
+        code += "}\n";
+        code += "});\n";
+        code += "}\n";
+        code += "});\n";
+
+        code += "stop_measure(start);\n\n";
+
+        if !single_pass {
+            let mut table_values_vec = "let table_values = vec![".to_string();
+            for idx in 0..pk.vk.cs.lookups.len() {
+                table_values_vec += &format!("table_values_{}, ", idx);
+            }
+            table_values_vec += "];\n";
+            code += &table_values_vec;
+        }
+
         println!("{}", code);
     }
 
@@ -532,6 +676,7 @@ pub fn create_proof<
                         &pk.fixed_values,
                         &instance.instance_values,
                         transcript,
+                        verify,
                     )
                 })
                 .collect();
@@ -576,7 +721,7 @@ pub fn create_proof<
             // Construct and commit to products for each lookup
             let res = lookups
                 .into_iter()
-                .map(|lookup| lookup.commit_product(pk, params, beta, gamma, transcript))
+                .map(|lookup| lookup.commit_product(pk, params, beta, gamma, transcript, verify))
                 .collect::<Result<Vec<_>, _>>();
             end_timer!(start);
             res
@@ -592,12 +737,6 @@ pub fn create_proof<
     // Obtain challenge for keeping all separate gates linearly independent
     let y: ChallengeY<_> = transcript.squeeze_challenge_scalar();
 
-    let start = start_timer!(|| format!("temp memcopies"));
-    let (product_cosets, (permuted_input_cosets, permuted_table_cosets)): (Vec<_>, (Vec<_>, Vec<_>)) = lookups[0]
-        .iter()
-        .map(|lookup| (&lookup.product_coset, (&lookup.permuted_input_coset, &lookup.permuted_table_coset)))
-        .unzip();
-    end_timer!(start);
     let start = start_timer!(|| format!("h(X) poly optimized ({})", lookups[0].len()));
     let h_poly = pk.vk.domain.lagrange_from_vec_ext(
         evaluate_hardcoded(
@@ -610,12 +749,8 @@ pub fn create_proof<
             *beta,
             *gamma,
             *theta,
-            &pk.l0,
-            &pk.l_blind,
-            &pk.l_last,
-            &product_cosets,
-            &permuted_input_cosets,
-            &permuted_table_cosets,
+            &pk,
+            &lookups,
         )
     );
     end_timer!(start);
@@ -641,8 +776,7 @@ pub fn create_proof<
         .unzip();
     end_timer!(start);
 
-    let verify_optimizations = false;
-    if verify_optimizations {
+    if verify {
         let start = start_timer!(|| format!("lookups commit_permuted {}", instance.len()));
         let compressed_cosets: Vec<Vec<lookup::prover::PermutedCosets<C>>> = instance
             .iter()
@@ -727,7 +861,7 @@ pub fn create_proof<
         let h_poly_b = expressions.fold(domain.empty_extended(), |h_poly, v| h_poly * *y + &v);
         for idx in 0..h_poly.values.len() {
             if h_poly.values[idx] != h_poly_b.values[idx] {
-                println!("*Incorrect Value: {:?} , {:?}", h_poly.values[idx], h_poly_b.values[idx]);
+                println!("*Incorrect Value [{}]: {:?} , {:?}", idx, h_poly.values[idx], h_poly_b.values[idx]);
             }
         }
     }
@@ -887,6 +1021,13 @@ pub fn create_proof<
     let start = start_timer!(|| "create_proof");
     let proof = multiopen::create_proof(params, transcript, instances).map_err(|_| Error::Opening);
     end_timer!(start);
+
+    #[allow(unsafe_code)]
+    unsafe {
+        println!("·FFT: {}s", (FFT_TOTAL_TIME as f32)/1000000.0);
+        println!("·MultiExps: {}s", (MULTIEXP_TOTAL_TIME as f32)/1000000.0);
+        println!("·Evaluate: {}s", (EVALUATE_TOTAL_TIME as f32)/1000000.0);
+    }
 
     proof
 }

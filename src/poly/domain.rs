@@ -365,13 +365,16 @@ fn recursive_fft_inner<F: FieldExt>(
     }
 }
 
+/// TEMP
+pub static mut FFT_TOTAL_TIME: usize = 0;
+
 fn recursive_fft<F: FieldExt>(data: &FFTData<F>, data_in: &mut Vec<F>, inverse: bool)
 {
     let num_threads = multicore::current_num_threads();
-    let start = start_measure(format!("recursive fft {} ({})", data_in.len(), num_threads));
+    let start = start_measure(format!("recursive fft {} ({})", data_in.len(), num_threads), false);
 
     // TODO: reuse scratch buffer between FFTs
-    let start_mem = start_measure(format!("alloc"));
+    let start_mem = start_measure(format!("alloc"), false);
     let mut scratch = vec![F::zero(); data_in.len()];
     stop_measure(start_mem);
 
@@ -385,9 +388,14 @@ fn recursive_fft<F: FieldExt>(data: &FFTData<F>, data_in: &mut Vec<F>, inverse: 
         0,
         num_threads,
     );
-    stop_measure(start);
+    let duration = stop_measure(start);
 
-    let start = start_measure(format!("copy"));
+    #[allow(unsafe_code)]
+    unsafe {
+        FFT_TOTAL_TIME += duration;
+    }
+
+    let start = start_measure(format!("copy"), false);
     // Will simply swap the vector's buffer, no data is actually copied
     std::mem::swap(data_in, &mut /*data.*/scratch);
     stop_measure(start);
@@ -549,7 +557,7 @@ impl<F: FieldExt> EvaluationDomain<F> {
         &self,
         values: Vec<F>,
     ) -> Polynomial<F, ExtendedLagrangeCoeff> {
-        assert_eq!(values.len(), self.extended_len() as usize);
+        //assert_eq!(values.len(), self.extended_len() as usize);
 
         Polynomial {
             values,

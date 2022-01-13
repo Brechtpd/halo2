@@ -135,6 +135,9 @@ pub fn small_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::C
     acc
 }
 
+/// TEMP
+pub static mut MULTIEXP_TOTAL_TIME: usize = 0;
+
 /// Performs a multi-exponentiation operation.
 ///
 /// This function will panic if coeffs and bases have a different length.
@@ -157,7 +160,7 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
     println!("size: {}, zeros: {}, ones: {}", coeffs.len(), count_zero, count_one);*/
 
     let num_threads = multicore::current_num_threads();
-    let start = start_measure(format!("best multiexp {} ({})", coeffs.len(), num_threads));
+    let start = start_measure(format!("best multiexp {} ({})", coeffs.len(), num_threads), false);
     if coeffs.len() > num_threads {
         let chunk = coeffs.len() / num_threads;
         let num_chunks = coeffs.chunks(chunk).len();
@@ -176,12 +179,24 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
             }
         });
         let res = results.iter().fold(C::Curve::identity(), |a, b| a + b);
-        stop_measure(start);
+        let duration = stop_measure(start);
+
+        #[allow(unsafe_code)]
+        unsafe {
+            MULTIEXP_TOTAL_TIME += duration;
+        }
+
         res
     } else {
         let mut acc = C::Curve::identity();
         multiexp_serial(coeffs, bases, &mut acc);
-        stop_measure(start);
+        let duration = stop_measure(start);
+
+        #[allow(unsafe_code)]
+        unsafe {
+            MULTIEXP_TOTAL_TIME += duration;
+        }
+
         acc
     }
 }
@@ -314,7 +329,7 @@ pub fn prefetch_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], sett
     assert_eq!(coeffs.len(), bases.len());
     let num_threads = multicore::current_num_threads();
 
-    let start = start_measure(format!("exponents to_repr {} ({})", coeffs.len(), num_threads));
+    let start = start_measure(format!("exponents to_repr {} ({})", coeffs.len(), num_threads), false);
     // Coeffs
     //let coeffs: Vec<_> = coeffs.iter().map(|a| a.to_repr()).collect();
     let mut exponents: Vec<_> = vec![C::Scalar::zero().to_repr(); coeffs.len()];
@@ -344,7 +359,7 @@ pub fn prefetch_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], sett
         }
     });*/
 
-    let start = start_measure(format!("prefetch multiexp {} ({}) {:?}", coeffs.len(), num_threads, settings));
+    let start = start_measure(format!("prefetch multiexp {} ({}) {:?}", coeffs.len(), num_threads, settings), false);
     if coeffs.len() > num_threads {
         let num_chunks = (254 + settings.c - 1) / settings.c;
         println!("num_chunks: {}", num_chunks);
@@ -403,7 +418,7 @@ pub fn best_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
     let threads = multicore::current_num_threads();
     let log_threads = log2_floor(threads);
 
-    let start = start_measure(format!("best_fft {} ({})", a.len(), threads));
+    let start = start_measure(format!("best_fft {} ({})", a.len(), threads), false);
     if log_n <= log_threads {
         serial_fft(a, omega, log_n);
     } else {
