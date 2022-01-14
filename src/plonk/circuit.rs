@@ -1055,10 +1055,10 @@ impl<F: Field> Expression<F> {
                 rotation,
             } => {
                 if rotation.0 == 0 {
-                    format!("fixed[{}].values[idx]", column_index)
+                    data.reuse_code(format!("fixed[{}].values[idx]", column_index))
                 } else {
                     let rot_id = data.add_rotation(rotation);
-                    format!("fixed[{}].values[{}]", column_index, rot_id)
+                    data.reuse_code(format!("fixed[{}].values[{}]", column_index, rot_id))
                 }
             }
             Expression::Advice {
@@ -1067,10 +1067,10 @@ impl<F: Field> Expression<F> {
                 rotation,
             } => {
                 if rotation.0 == 0 {
-                    format!("advice[{}].values[idx]", column_index)
+                    data.reuse_code(format!("advice[{}].values[idx]", column_index))
                 } else {
                     let rot_id = data.add_rotation(rotation);
-                    format!("advice[{}].values[{}]", column_index, rot_id)
+                    data.reuse_code(format!("advice[{}].values[{}]", column_index, rot_id))
                 }
             }
             Expression::Instance {
@@ -1079,10 +1079,10 @@ impl<F: Field> Expression<F> {
                 rotation,
             } => {
                 if rotation.0 == 0 {
-                    format!("instance[{}].values[idx]", column_index)
+                    data.reuse_code(format!("instance[{}].values[idx]", column_index))
                 } else {
                     let rot_id = data.add_rotation(rotation);
-                    format!("instance[{}].values[{}]", column_index, rot_id)
+                    data.reuse_code(format!("instance[{}].values[{}]", column_index, rot_id))
                 }
             }
             Expression::Negated(a) => {
@@ -1101,17 +1101,33 @@ impl<F: Field> Expression<F> {
                 }
             }
             Expression::Sum(a, b) => {
-                let code_a = a.generate_code2(data);
-                let code_b = b.generate_code2(data);
-                if code_a == "c_0" {
-                    code_b
-                } else if code_b == "c_0" {
-                    code_a
-                } else {
-                    if code_a <= code_b {
-                        data.reuse_code(format!("({}+{})", code_a, code_b))
-                    } else {
-                        data.reuse_code(format!("({}+{})", code_b, code_a))
+                // Undo subtraction as a + (-b)
+                match &**b {
+                    Expression::Negated(b_int) => {
+                        let code_a = a.generate_code2(data);
+                        let code_b = b_int.generate_code2(data);
+                        if code_a == "c_0" {
+                            code_b
+                        } else if code_b == "c_0" {
+                            code_a
+                        } else {
+                            data.reuse_code(format!("({}-{})", code_a, code_b))
+                        }
+                    }
+                    _ => {
+                        let code_a = a.generate_code2(data);
+                        let code_b = b.generate_code2(data);
+                        if code_a == "c_0" {
+                            code_b
+                        } else if code_b == "c_0" {
+                            code_a
+                        } else {
+                            if code_a <= code_b {
+                                data.reuse_code(format!("({}+{})", code_a, code_b))
+                            } else {
+                                data.reuse_code(format!("({}+{})", code_b, code_a))
+                            }
+                        }
                     }
                 }
             }
