@@ -853,15 +853,15 @@ pub fn evaluate<F: FieldExt, B: Basis>(
                 &|_| panic!("virtual selectors are removed during optimization"),
                 &|_, column_index, rotation| {
                     let new_rotation = rot_scale * rotation.0;
-                    fixed[column_index].values[(((idx as i32) + new_rotation) % isize) as usize]
+                    fixed[column_index].values[(((idx as i32) + new_rotation).rem_euclid(isize)) as usize]
                 },
                 &|_, column_index, rotation| {
                     let new_rotation = rot_scale * rotation.0;
-                    advice[column_index].values[(((idx as i32) + new_rotation) % isize) as usize]
+                    advice[column_index].values[(((idx as i32) + new_rotation).rem_euclid(isize)) as usize]
                 },
                 &|_, column_index, rotation| {
                     let new_rotation = rot_scale * rotation.0;
-                    instance[column_index].values[(((idx as i32) + new_rotation) % isize) as usize]
+                    instance[column_index].values[(((idx as i32) + new_rotation).rem_euclid(isize)) as usize]
                 },
                 &|a| -a,
                 &|a, b| a + &b,

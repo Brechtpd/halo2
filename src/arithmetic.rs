@@ -515,10 +515,28 @@ fn parallel_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32, log_threads
 
 /// This evaluates a provided polynomial (in coefficient form) at `point`.
 pub fn eval_polynomial<F: Field>(poly: &[F], point: F) -> F {
-    // TODO: parallelize?
-    poly.iter()
-        .rev()
-        .fold(F::zero(), |acc, coeff| acc * point + coeff)
+    let n = poly.len();
+    let num_threads = multicore::current_num_threads();
+    let mut chunk = (n as usize) / num_threads;
+    if chunk < num_threads {
+        chunk = n as usize;
+    }
+
+    let mut parts = vec![F::zero(); num_threads];
+    multicore::scope(|scope| {
+        for (chunk_num, (out, poly)) in
+            parts.chunks_mut(1)
+            .zip(poly.chunks(chunk))
+            .enumerate() {
+            scope.spawn(move |_| {
+                let start = chunk_num * chunk;
+                out[0] = poly.iter().rev().fold(F::zero(), |acc, coeff| acc * point + coeff)
+                    * point.pow_vartime(&[start as u64, 0, 0, 0]);
+            });
+        }
+    });
+
+    parts.iter().fold(F::zero(), |acc, coeff| acc + coeff)
 }
 
 /// This computes the inner product of two vectors `a` and `b`.

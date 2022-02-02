@@ -34,11 +34,13 @@ impl<C: ColumnType> Column<C> {
         Column { index, column_type }
     }
 
-    pub(crate) fn index(&self) -> usize {
+    /// Index
+    pub fn index(&self) -> usize {
         self.index
     }
 
-    pub(crate) fn column_type(&self) -> &C {
+    /// Column type
+    pub fn column_type(&self) -> &C {
         &self.column_type
     }
 }
