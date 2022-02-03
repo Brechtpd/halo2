@@ -24,6 +24,8 @@
 // Remove this once we update pasta_curves
 #![allow(unused_imports)]
 
+#![recursion_limit="256"]
+
 pub mod arithmetic;
 pub mod circuit;
 pub use pairing;
@@ -34,3 +36,6 @@ pub mod transcript;
 
 pub mod dev;
 mod helpers;
+
+#[macro_use]
+extern crate itertools;

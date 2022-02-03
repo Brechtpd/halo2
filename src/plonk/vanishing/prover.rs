@@ -11,6 +11,8 @@ use crate::{
     },
     transcript::{EncodedChallenge, TranscriptWrite},
 };
+use ark_std::{end_timer, start_timer};
+
 
 pub(in crate::plonk) struct Committed<C: CurveAffine> {
     random_poly: Polynomial<C::Scalar, Coeff>,
@@ -52,27 +54,30 @@ impl<C: CurveAffine> Committed<C> {
         self,
         params: &Params<C>,
         domain: &EvaluationDomain<C::Scalar>,
-        expressions: impl Iterator<Item = Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
-        y: ChallengeY<C>,
+        h_poly: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
         transcript: &mut T,
     ) -> Result<Constructed<C>, Error> {
-        // Evaluate the h(X) polynomial's constraint system expressions for the constraints provided
-        let h_poly = expressions.fold(domain.empty_extended(), |h_poly, v| h_poly * *y + &v);
-
         // Divide by t(X) = X^{params.n} - 1.
+        let start = start_timer!(|| format!("h_poly div ({})", h_poly.values.len()));
         let h_poly = domain.divide_by_vanishing_poly(h_poly);
+        end_timer!(start);
 
         // Obtain final h(X) polynomial
+        let start = start_timer!(|| format!("h_poly final ({})", h_poly.values.len()));
         let h_poly = domain.extended_to_coeff(h_poly);
+        end_timer!(start);
 
         // Split h(X) up into pieces
+        let start = start_timer!(|| format!("split final ({})", h_poly.len()));
         let h_pieces = h_poly
             .chunks_exact(params.n as usize)
             .map(|v| domain.coeff_from_vec(v.to_vec()))
             .collect::<Vec<_>>();
         drop(h_poly);
+        end_timer!(start);
 
         // Compute commitments to each h(X) piece
+        let start = start_timer!(|| format!("commits ({})", h_pieces.len()));
         let h_commitments_projective: Vec<_> = h_pieces
             .iter()
             .map(|h_piece| params.commit(h_piece))
@@ -80,6 +85,7 @@ impl<C: CurveAffine> Committed<C> {
         let mut h_commitments = vec![C::identity(); h_commitments_projective.len()];
         C::Curve::batch_normalize(&h_commitments_projective, &mut h_commitments);
         let h_commitments = h_commitments;
+        end_timer!(start);
 
         // Hash each h(X) piece
         for c in h_commitments.iter() {

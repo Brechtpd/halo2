@@ -50,7 +50,8 @@ impl Basis for ExtendedLagrangeCoeff {}
 /// basis.
 #[derive(Clone, Debug)]
 pub struct Polynomial<F, B> {
-    values: Vec<F>,
+    /// Temp
+    pub values: Vec<F>,
     _marker: PhantomData<B>,
 }
 
