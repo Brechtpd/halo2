@@ -1,5 +1,6 @@
 use core::cmp::max;
 use core::ops::{Add, Mul};
+use std::env::var;
 use ff::Field;
 use std::{
     convert::TryFrom,
@@ -1926,6 +1927,14 @@ impl<F: Field> ConstraintSystem<F> {
                 .max()
                 .unwrap_or(0),
         );
+
+        fn get_max_degree() -> usize {
+            var("MAX_DEGREE")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .expect("Cannot parse MAX_DEGREE env var as usize")
+        }
+        degree = std::cmp::min(degree, get_max_degree());
 
         std::cmp::max(degree, self.minimum_degree.unwrap_or(1))
     }
